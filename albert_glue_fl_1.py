@@ -273,18 +273,21 @@ def perturbed_inference_train(model, train_loader, num_epochs, learning_rate, pe
 
     return model
 
-def bp_train(model, train_loader, test_loader, num_epochs, learning_rate, training_steps, warmup_steps, client_id):
+def bp_train(model, train_loader, test_loader, num_epochs, learning_rate,
+             total_training_steps, warmup_steps, client_id, gradient_accumulation_steps=4):
+
     print(">>>> Start normal fine tuning")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     optimizer = AdamW(model.parameters(), lr=learning_rate, eps=1e-8, weight_decay=0.01)
-    # Set up the learning rate scheduler with warmup steps
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_steps)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps
+    )
 
     loss_fn = torch.nn.CrossEntropyLoss()
-    gradient_accumulation_steps = 4
-
     model.train()
     metrics = []
 
@@ -293,6 +296,7 @@ def bp_train(model, train_loader, test_loader, num_epochs, learning_rate, traini
         total_batches = 0
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
+        optimizer.zero_grad()
 
         for step, batch in enumerate(progress_bar):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -311,16 +315,17 @@ def bp_train(model, train_loader, test_loader, num_epochs, learning_rate, traini
             if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                scheduler.step()  # Update learning rate
+                scheduler.step()
                 optimizer.zero_grad()
 
-            del outputs, loss, scaled_loss
+            # Proper cleanup for CUDA memory management
+            del outputs, loss, scaled_loss, batch
             torch.cuda.empty_cache()
 
-            if total_batches > 0:
-                avg_loss = total_loss / total_batches
-                progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
+            avg_loss = total_loss / total_batches
+            progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
+        # Evaluate after each epoch
         train_epoch_loss, train_epoch_accuracy = evaluate(model, train_loader, loss_fn)
         test_epoch_loss, test_epoch_accuracy = evaluate(model, test_loader, loss_fn)
 
@@ -378,7 +383,7 @@ def check_label_balance(data, threshold=0.1):
             print("=> Only one label present in the dataset.\n")
 
 def train_for_client(client_id, model_path, tokenizer, batch_size, num_epochs, learning_rate,
-                     perturbation_strength, max_length, training_steps, warmup_steps):
+                     perturbation_strength, max_length, gradient_accumulation_steps=4):
 
     print(f">>>>Start training client {client_id}")
     client_file_index = client_id - 1
@@ -400,6 +405,10 @@ def train_for_client(client_id, model_path, tokenizer, batch_size, num_epochs, l
     tokenized_test_dataset = test_dataset.map(lambda x: tokenize_function(x, tokenizer, max_length), batched=True)
     test_loader = DataLoader(tokenized_test_dataset, batch_size, shuffle=False, collate_fn=collate_fn)
 
+    effective_steps_per_epoch = math.ceil(len(train_loader) / gradient_accumulation_steps)
+    total_training_steps = effective_steps_per_epoch * num_epochs
+    warmup_steps = int(total_training_steps * 0.1)
+
     # Load configuration from the saved model path and set dropout parameters
     config = AutoConfig.from_pretrained(model_path)
     config.num_labels = 2
@@ -420,7 +429,7 @@ def train_for_client(client_id, model_path, tokenizer, batch_size, num_epochs, l
     # Pass training_steps and warmup_steps to bp_train
     measure_function_energy(
         bp_train,
-        args=(model, train_loader, test_loader, num_epochs, learning_rate, training_steps, warmup_steps, client_id),
+        args=(model, train_loader, test_loader, num_epochs, learning_rate, total_training_steps, warmup_steps, client_id),
         interval=1,
         output_file=f"energy_log_client_{client_id}.csv"
     )
@@ -584,17 +593,15 @@ def main():
     batch_size = 16
     seed = 42
     num_epochs = 1
-    learning_rate = 2e-5  # Static learning rate as requested
+    learning_rate = 2e-5
     perturbation_strength = 0.1
-    training_steps = 20935  # TS (Training Steps)
-    warmup_steps = 1252     # WS (Warmup Steps)
+    gradient_accumulation_steps = 4
 
     model_name = "albert-base-v2"
     model_path = "./global_models"
     dataset_train_path = "datasets"
     task = "sst2"
 
-    # Set seeds for reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -607,81 +614,48 @@ def main():
 
     num_clients = get_number_of_clients()
     prepare_and_split_dataset(task, num_clients, seed, dataset_train_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Set up CSV file for tracking metrics
     with open("federated_training_results.csv", mode="w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["Round", "Accuracy", "Loss"])
 
-    # Store initial model for checking significant deviations
     initial_state_dict = {k: v.clone().detach().cpu() for k, v in global_model.state_dict().items()}
 
-    for round_num in range(1, round_number+1):
+    for round_num in range(1, round_number + 1):
         print(f">>>>>Start round {round_num}")
 
-        # List to collect client models
         client_model_states = []
 
         for client_id in range(1, num_clients + 1):
-            # Pass training_steps and warmup_steps to train_for_client
             client_model_state = train_for_client(
                 client_id, model_path, tokenizer, batch_size, num_epochs,
-                learning_rate, perturbation_strength, max_length, training_steps, warmup_steps
+                learning_rate, perturbation_strength, max_length, gradient_accumulation_steps
             )
 
-            # Convert to CPU for consistent aggregation
             client_model_states.append({k: v.cpu() for k, v in client_model_state.items()})
 
-
-        # Inside main() loop aggregation:
         global_model_state = {}
         for key in client_model_states[0].keys():
-            # Ensure all client tensors are CPU and float32
-            tensors = [client_state[key].float().cpu() for client_state in client_model_states]
+            tensors = [state[key].float().cpu() for state in client_model_states]
+            avg_tensor = torch.stack(tensors).mean(dim=0)
 
-            # Check for NaN/Inf in individual client models
-            valid_tensors = []
-            for t in tensors:
-                if not (torch.isnan(t).any() and not (torch.isinf(t)).any()):
-                    valid_tensors.append(t)
+            global_model_state[key] = avg_tensor
 
-            if len(valid_tensors) == 0:
-                print(f"All clients have NaN/Inf in {key}, using initial value")
-                global_model_state[key] = initial_state_dict[key].clone()
-                continue
-
-            # Average valid tensors
-            avg_tensor = torch.stack(valid_tensors).mean(dim=0)
-
-            # Check averaged tensor
-            if torch.isnan(avg_tensor).any() or torch.isinf(avg_tensor).any():
-                print(f"NaN/Inf detected in {key} after averaging, using initial value")
-                global_model_state[key] = initial_state_dict[key].clone()
-            else:
-                global_model_state[key] = avg_tensor
-
-        # Move state to model's device before loading
         device = next(global_model.parameters()).device
-        global_model_state = {k: v.to(device) for k, v in global_model_state.items()}
-        global_model.load_state_dict(global_model_state)
+        global_model.load_state_dict({k: v.to(device) for k, v in global_model_state.items()})
 
-        # Save checkpoint
         os.makedirs("global_models", exist_ok=True)
-        global_model.save_pretrained(f"./global_models")
+        global_model.save_pretrained(model_path)
         print(f"Global Model saved for Round {round_num}")
 
-        # Evaluate the model
         accuracy, loss = evaluate_global_model(task, global_model, tokenizer, device, batch_size, max_length)
 
-        print(f"Round {round_num} - Accuracy: {accuracy:.4f}, Loss: {loss:.4f}")
-
-        # Write results to CSV
         with open("federated_training_results.csv", mode="a", newline="") as file:
             writer = csv.writer(file)
             writer.writerow([round_num, accuracy, loss])
 
-    # Final evaluation and summary
+        print(f"Round {round_num} - Accuracy: {accuracy:.4f}, Loss: {loss:.4f}")
+
     print("\nTraining completed!")
 
 if __name__ == "__main__":
